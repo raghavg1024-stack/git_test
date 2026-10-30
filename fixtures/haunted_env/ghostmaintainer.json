@@ -1,0 +1,4 @@
+{
+  "cmd": "python app.py test",
+  "marker": "GHOST_SMOKE_OK: 1 check passed"
+}
