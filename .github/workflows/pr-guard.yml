@@ -1,0 +1,57 @@
+name: GhostMaintainer PR Guard
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/**'
+      - '**/Dockerfile'
+      - '**/Makefile'
+      - '**/pyproject.toml'
+      - '**/requirements*.txt'
+      - '**/package.json'
+permissions:
+  contents: read
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          path: target
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          persist-credentials: false
+          path: trusted
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: docker pull python:3.12-slim
+      - name: Check changed setup using trusted rules-only code
+        run: python trusted/ghostmaintainer.py guard target/fixtures/haunted_env --out evidence
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: onboarding-evidence
+          path: evidence/
+  comment:
+    needs: inspect
+    if: always() && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      pull-requests: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: onboarding-evidence
+          path: evidence
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const body = fs.readFileSync('evidence/comment.md', 'utf8').slice(0, 60000);
+            await github.rest.issues.createComment({owner: context.repo.owner, repo: context.repo.repo, issue_number: context.issue.number, body});
