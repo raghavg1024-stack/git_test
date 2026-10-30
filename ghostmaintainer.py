@@ -163,7 +163,7 @@ def run(repo, steps, goal, backend='docker', network=False, text=None, image='py
                         env[key] = os.environ[key]
                 try:
                     result = subprocess.run([sys.executable, 'app.py', args[2]], cwd=workspace,
-                                            env=env, capture_output=True, text=True, timeout=15, stdin=subprocess.DEVNULL)
+                                            env=env, capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=15, stdin=subprocess.DEVNULL)
                     code, output = result.returncode, result.stdout + result.stderr
                 except subprocess.TimeoutExpired:
                     code, output = 124, 'timeout'
@@ -195,8 +195,10 @@ def run(repo, steps, goal, backend='docker', network=False, text=None, image='py
                        '--tmpfs', '/workspace:rw,exec,size=256m,mode=1777',
                        '--user=65534:65534', image, 'sh', '-c',
                        'cp -R /input/repo/. /workspace/ && sh /input/run.sh']
+            if os.environ.get('GHOST_SCAN_TAG'):
+                command[2:2]=['--label', 'ghostmaintainer.scan='+os.environ['GHOST_SCAN_TAG']]
             try:
-                result = subprocess.run(command, capture_output=True, text=True, timeout=90, stdin=subprocess.DEVNULL)
+                result = subprocess.run(command, capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=90, stdin=subprocess.DEVNULL)
             except subprocess.TimeoutExpired:
                 subprocess.run(['docker', 'rm', '-f', name], capture_output=True, timeout=15)
                 return {'ok': False, 'status': 'timeout', 'events': [], 'reason': 'Container exceeded 90 seconds'}
@@ -241,8 +243,11 @@ def drill(repo, options, override=None):
     report = {'repo': repo.name, 'backend': options.backend, 'model': metadata,
               'goal': goal, 'original': initial, 'patches': [], 'status': 'healthy' if initial['ok'] else 'needs_human',
               'baseline': baseline(repo), 'label_disagreement': False, 'image': image}
-    from features import drift
-    report['drift'] = drift(repo)
+    try:
+        from features import drift
+        report['drift'] = drift(repo)
+    except (ValueError, OSError, SyntaxError) as error:
+        report['drift_error'] = str(error)
     if initial['ok']:
         report['duration_s'] = round(time.perf_counter()-started, 3)
         return report
@@ -271,7 +276,8 @@ def drill(repo, options, override=None):
             disagreement = verification_steps != normal_steps
             result = run(repo, verification_steps, goal, options.backend, options.net, proposed, image)
             progress = sum(e['exit_code'] == 0 and not e['goal'] for e in result['events'])
-            trials.append({'candidate': candidate, 'status': result['status'], 'passed_setup_steps': progress})
+            trials.append({'candidate': candidate, 'status': result['status'], 'passed_setup_steps': progress,
+                           'sandbox_time_s': round(sum(e.get('duration_s',0) for e in result['events']),3)})
             previous_failure = current_run['events'][-1].get('output', '') if current_run['events'] else ''
             new_failure = result['events'][-1].get('output', '') if result['events'] else ''
             # Ignore traceback file paths, which change in every fresh sandbox.
@@ -361,8 +367,11 @@ def save_report(report, destination):
     page += f'<p>Execution: {escape(report["backend"])} · Command selection: {escape(model)} · Cached selection: {report["model"]["cached"]}</p><p>Labeller disagreement: {report["label_disagreement"]}</p>' + sections
     page += f'<h3>Exact documentation diff</h3><pre>{escape(report.get("diff", "No verified patch."))}</pre><h3>Command sources</h3><ul>{provenance or "<li>No repair proposed.</li>"}</ul><p><a href="report.json">Raw report data</a> · <a href="events.jsonl">Execution events</a></p></details></section>'
     page += '<footer>This is a recorded result, not a live terminal. Synthetic demo repositories contain deliberately missing instructions. Passing verifies the declared check in this environment; it does not prove that every feature works.</footer></main></body></html>'
-    from features import report_panels
-    page = page.replace('</main>', report_panels(report) + '</main>')
+    try:
+        from features import report_panels
+        page = page.replace('</main>', report_panels(report) + '</main>')
+    except (ValueError, OSError, KeyError, TypeError) as error:
+        page = page.replace('</main>', '<p>Optional feature panels unavailable: '+escape(error)+'</p></main>')
     (destination / 'replay.html').write_text(page, encoding='utf-8')
 
 

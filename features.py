@@ -5,6 +5,7 @@ from collections import Counter
 import concurrent.futures
 import html
 import json
+import os
 from pathlib import Path
 import re
 import statistics
@@ -68,8 +69,16 @@ def drift(repo):
     for path in paths:
         if not path.exists():
             continue
+        version_list = None
         for n, line in enumerate(gm.read(path).splitlines(), 1):
             matches = []
+            if re.search(r'python-version:\s*$',line):
+                version_list=len(line)-len(line.lstrip())
+            elif version_list is not None:
+                if line.strip() and len(line)-len(line.lstrip())<=version_list:
+                    version_list=None
+                else:
+                    matches += [('python',v) for v in re.findall(r'^\s*-\s*["\x27]?(\d+\.\d+)',line)]
             if path.name == 'README.md':
                 matches = [('python', m) for m in re.findall(r'(?i)Python\s+(\d+\.\d+)', line)] + [('node', m) for m in re.findall(r'(?i)Node(?:\.js)?\s+(\d+)', line)]
             elif path.name in ('.python-version', '.nvmrc'):
@@ -91,6 +100,15 @@ def drift(repo):
             for config in configured:
                 if doc['value'] != config['value']:
                     notes.append({'kind': 'version', 'message': f'{language}: README says {doc["value"]}; configuration specifies {config["value"]}. Check compatibility; different supported versions are not necessarily errors.', 'readme': doc, 'configuration': config})
+        for doc in declared:
+            for constraint in [v for v in versions if v['language']==language+'-range']:
+                version=tuple(int(n) for n in doc['value'].split('.'))
+                for operator,value in re.findall(r'(>=|<=|==|>|<)\s*(\d+(?:\.\d+)*)',constraint['value']):
+                    bound=tuple(int(n) for n in value.split('.'))
+                    width=max(len(version),len(bound));left=version+(0,)*(width-len(version));right=bound+(0,)*(width-len(bound))
+                    compatible={'>=':left>=right,'<=':left<=right,'>':left>right,'<':left<right,'==':left==right}[operator]
+                    if not compatible:
+                        notes.append({'kind':'version','message':f'{language} {doc["value"]} in README conflicts with declared constraint {operator}{value}.','readme':doc,'configuration':constraint})
     return {'notes': notes, 'version_evidence': versions, 'scope': 'Advisory literal Python/Node scan; no patches. Dynamic variable names and version-range compatibility are not inferred.'}
 
 
@@ -151,7 +169,7 @@ def matrix(repo, options):
         cells = list(pool.map(cell, environments))
     audit = drift(repo)
     pins = [v for v in audit['version_evidence'] if v['language']=='python' and '.github/' in v['source']]
-    note = f'Requires Python {pins[0]["value"]} (source: {pins[0]["source"]}).' if pins and any(not c['report']['original']['ok'] for c in cells) else None
+    note = f'CI uses Python {pins[0]["value"]} (source: {pins[0]["source"]}). Use this version for the documented setup.' if pins and any(not c['report']['original']['ok'] for c in cells) else None
     result = {'cells':[{'environment':c['environment'],'status':c['report']['status'],'image':c['image']} for c in cells], 'version_note':note,
               'note_limit':'A documented support version does not repair an unsupported runtime.'}
     folder = options.out/repo.name
@@ -161,6 +179,11 @@ def matrix(repo, options):
         original = gm.read(repo/'README.md')
         patch = ''.join(difflib.unified_diff(original.splitlines(True),(original.rstrip()+'\n\n'+note+'\n').splitlines(True),fromfile='a/README.md',tofile='b/README.md'))
         (folder/'version-note.patch').write_text(patch,encoding='utf-8')
+        text=original.rstrip()+'\n\n'+note+'\n'
+        goal=json.loads(gm.read(repo/'ghostmaintainer.json'))
+        checked=gm.run(repo,gm.extract(text),goal,'docker',options.net,text,image=f'python:{pins[0]["value"]}-slim')
+        result['version_note_verification']=checked
+        gm.write_json(folder/'matrix.json',result)
     commands = list(dict.fromkeys(e['cmd'] for c in cells for e in c['report']['original']['events']))
     rows = ''
     for command in commands:
@@ -191,7 +214,7 @@ def clone(url, destination, commit=None):
     canonical = repository_url(url)
     import os
     env = {**os.environ,'GIT_TERMINAL_PROMPT':'0','GIT_CONFIG_GLOBAL':os.devnull,'GIT_CONFIG_NOSYSTEM':'1','GIT_LFS_SKIP_SMUDGE':'1'}
-    result = subprocess.run(['git','-c','credential.helper=','clone','--depth','1','--no-recurse-submodules','--',canonical,str(destination)],capture_output=True,text=True,timeout=45,env=env,stdin=subprocess.DEVNULL)
+    result = subprocess.run(['git','-c','credential.helper=','clone','--depth','1','--no-recurse-submodules','--',canonical,str(destination)],capture_output=True,text=True, encoding='utf-8', errors='replace',timeout=45,env=env,stdin=subprocess.DEVNULL)
     if result.returncode:
         raise ValueError('Clone failed')
     if commit:
@@ -201,7 +224,7 @@ def clone(url, destination, commit=None):
         subprocess.run(['git','-C',str(destination),'checkout','--detach',commit],check=True,capture_output=True,timeout=10,env=env)
     if any(p.is_symlink() for p in destination.rglob('*')):
         raise ValueError('Symlinked repositories are unsupported')
-    return subprocess.check_output(['git','-C',str(destination),'rev-parse','HEAD'],text=True).strip()
+    return subprocess.check_output(['git','-C',str(destination),'rev-parse','HEAD'],text=True, encoding='utf-8', errors='replace').strip()
 
 
 def scan(options):
@@ -210,6 +233,7 @@ def scan(options):
     results = []
     for index,url in enumerate(urls):
         row = {'index':index+1}
+        tag=f'scan-{os.urandom(6).hex()}'
         with tempfile.TemporaryDirectory(prefix='ghost-scan-') as temp:
             repo = Path(temp)/'repo'
             try:
@@ -228,7 +252,7 @@ def scan(options):
                 command = [sys.executable,str(gm.ROOT/'ghostmaintainer.py'),'drill',str(repo),'--out',str(Path(temp)/'results'),'--image',options.image]
                 if options.net:
                     command += ['--net']
-                subprocess.run(command,capture_output=True,text=True,timeout=options.timeout,stdin=subprocess.DEVNULL)
+                subprocess.run(command,capture_output=True,text=True, encoding='utf-8', errors='replace',timeout=options.timeout,stdin=subprocess.DEVNULL,env={**os.environ,'GHOST_SCAN_TAG':tag})
                 reports = list((Path(temp)/'results').rglob('report.json'))
                 if not reports:
                     raise ValueError('inconclusive: no report')
@@ -241,6 +265,14 @@ def scan(options):
                 row.update(status='inconclusive',signature='timeout')
             except (ValueError,OSError,subprocess.SubprocessError) as error:
                 row.update(status='skipped' if str(error).startswith('skip:') else 'inconclusive',signature=str(error))
+            finally:
+                # Remove only containers carrying this scan's random label after a total deadline.
+                try:
+                    ids=subprocess.check_output(['docker','ps','-aq','--filter',f'label=ghostmaintainer.scan={tag}'],text=True, encoding='utf-8', errors='replace',timeout=10).split()
+                    if ids:
+                        subprocess.run(['docker','rm','-f',*ids],capture_output=True,timeout=15)
+                except (OSError,subprocess.SubprocessError):
+                    pass
         results.append(row)
         (options.out/'scan_results.jsonl').write_text('\n'.join(json.dumps(r) for r in results)+'\n',encoding='utf-8')
     count = Counter(r['status'] for r in results)
@@ -314,6 +346,13 @@ def report_panels(report):
         if data['slowest_step']:
             panels += f'<p>Slowest: {escape(data["slowest_step"]["cmd"])}</p>'
     panels += '</section>'
+    timing=friction(report)
+    if report.get('verification',{}).get('ok'):
+        initial=sum(timing.get(p,{}).get('sandbox_time_s') or 0 for p in ('original','negative_control'))
+        search=sum(t.get('sandbox_time_s',0) for t in report.get('trials',[]))
+        panels += f'<section><h2>Time to first verified green</h2><p>{round(initial+search,3)} seconds of measured command execution across original, control, and repair trials. Excludes model inference, container startup, and image downloads; not human time.</p></section>'
+    if report.get('ship'):
+        panels += '<section><h2>Setup artifacts</h2><p>setup.sh passed a separate fresh-container check. The devcontainer and agent document were generated, not separately run.</p><p><a href="ship/setup.sh">Verified setup.sh</a> · <a href="ship/devcontainer.json">devcontainer.json</a> · <a href="ship/AGENTS_setup.md">Agent setup instructions</a> · <a href="ship/verification.json">Verification evidence</a></p></section>'
     if report.get('drift') is not None:
         notes=report['drift']['notes']
         panels += '<section><h2>Config drift notes · advisory</h2>'+(''.join(f'<p>{escape(n["message"])} <small>{escape(n.get("source",n.get("configuration",{}).get("source","")))}</small></p>' for n in notes) or '<p>No literal environment or version drift found in the supported checks.</p>')+'</section>'
@@ -321,9 +360,27 @@ def report_panels(report):
     if not events:
         return panels
     payload=json.dumps(events).replace('<','\\u003c').replace('>','\\u003e').replace('&','\\u0026')
-    panels += '<section><h2>Replay the recorded run</h2><p>Move the slider or use its arrow keys. This replays saved evidence; it does not rerun commands.</p><input id="replaySlider" aria-label="Recorded step" type="range" min="0" max="'+str(len(events)-1)+'" value="0" style="width:100%"><p id="replayLabel"></p><pre id="replayOutput"></pre><p id="replayScore"></p><noscript><p>JavaScript is off. Expand the full logs above to read the complete static timeline.</p></noscript></section>'
-    panels += '<script type="application/json" id="replayData">'+payload+'</script><script>(()=>{const events=JSON.parse(document.getElementById("replayData").textContent),slider=document.getElementById("replaySlider");function show(){const i=Number(slider.value),e=events[i],seen=events.slice(0,i+1).filter(x=>x.phase===e.phase),passed=seen.filter(x=>x.exit_code===0).length;document.getElementById("replayLabel").textContent=`Step ${i+1} of ${events.length} · ${e.phase} · ${e.cmd} · ${e.exit_code===0?"passed":"failed"}`;document.getElementById("replayOutput").textContent=e.output;document.getElementById("replayScore").textContent=`${passed}/${seen.length} executed steps passed in this phase so far. This is step completion, not overall correctness.`;}slider.addEventListener("input",show);show();})();</script>'
+    panels += '<section><h2>Replay the recorded run</h2><p>Move the slider or use its arrow keys. This replays saved evidence; it does not rerun commands.</p><input id="replaySlider" aria-label="Recorded step" type="range" min="0" max="'+str(len(events)-1)+'" value="0" style="width:100%"><ol>'+''.join(f'<li id="timeline-{i}">{escape(e["phase"])} · {escape(e["cmd"])} · {"passed" if e["exit_code"]==0 else "failed"}</li>' for i,e in enumerate(events))+'</ol><p id="replayLabel"></p><pre id="replayOutput"></pre><p id="replayScore"></p><noscript><p>JavaScript is off. Expand the full logs above to read the complete static timeline.</p></noscript></section>'
+    panels += '<script type="application/json" id="replayData">'+payload+'</script><script>(()=>{const events=JSON.parse(document.getElementById("replayData").textContent),slider=document.getElementById("replaySlider");function show(){const i=Number(slider.value),e=events[i],seen=events.slice(0,i+1).filter(x=>x.phase===e.phase),passed=seen.filter(x=>x.exit_code===0).length;events.forEach((_,j)=>{const row=document.getElementById("timeline-"+j);row.style.background=j===i?"#d7efdf":"transparent";row.setAttribute("aria-current",String(j===i));});document.getElementById("replayLabel").textContent=`Step ${i+1} of ${events.length} · ${e.phase} · ${e.cmd} · ${e.exit_code===0?"passed":"failed"}`;document.getElementById("replayOutput").textContent=e.output;document.getElementById("replayScore").textContent=`${passed}/${seen.length} executed steps passed in this phase so far. This is step completion, not overall correctness.`;}slider.addEventListener("input",show);show();})();</script>'
     return panels
+
+
+def summary_page(destination, kind, data):
+    destination.mkdir(parents=True,exist_ok=True)
+    escape=lambda value:html.escape(str(value))
+    titles={'bench-models':'GhostBench v0 · measured model comparison','scan':'Ecosystem scan · local aggregate','drift':'Configuration drift · advisory notes'}
+    content=''
+    if kind=='bench-models':
+        content='<table><tr><th>Model</th><th>Label accuracy</th><th>Mutation recovery</th><th>False positives</th><th>Median label time</th></tr>'
+        for row in data:
+            content+=f'<tr><td>{escape(row["model"])}</td><td>{row["label_accuracy"]} (n={row["n_steps"]} steps)</td><td>{row["recovery_rate"]} (n={row["n_failure_inducing_mutations"]})</td><td>{row["false_positives"]} / {row["n_healthy_repos"]} healthy</td><td>{row["median_label_latency_s"]} s (n={row["n_readmes"]})</td></tr>'
+        content+='</table><p>Small v0 sample, not a general ranking. Cache hits may affect latency. End-to-end recovery covers bundled fixtures, not the upstream selection-only case.</p><a href="BENCH.md">Download benchmark</a>'
+    elif kind=='scan':
+        content=f'<p>{data["n_completed"]} repositories processed. Skipped repositories are not counted as healthy.</p><table><tr><th>Outcome</th><th>Count</th><th>% of selected sample</th></tr>'+''.join(f'<tr><td>{escape(key)}</td><td>{value}</td><td>{data["percent_of_selected"][key]}%</td></tr>' for key,value in data['counts'].items())+'</table><p>Hand-selected local sample. No ecosystem-wide prevalence claim. Do not publish aggregate findings without organizer approval.</p><a href="scan_results.jsonl">Download anonymous outcomes</a>'
+    else:
+        content=''.join('<section><strong>'+escape(note['message'])+'</strong><pre>'+escape(json.dumps(note,indent=2))+'</pre></section>' for note in data['notes']) or '<p>No drift found by the supported literal checks.</p>'
+    gm.write_json(destination/'report.json',data)
+    (destination/'summary.html').write_text('<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>'+titles[kind]+'</title><style>body{font:16px/1.6 system-ui;max-width:1100px;margin:40px auto;padding:20px;background:#f4f7f5;color:#193a2b}table{border-collapse:collapse;background:white;width:100%}td,th{padding:14px;text-align:left;border:1px solid #cddbd2}section{background:white;padding:20px;margin:15px 0}pre{white-space:pre-wrap;overflow-wrap:anywhere}a{color:#17613f}</style><h1>'+titles[kind]+'</h1>'+content+'</html>',encoding='utf-8')
 
 
 def main(argv):
@@ -355,7 +412,9 @@ def main(argv):
             result=gm.drill(options.repo.resolve(),options)
             gm.save_report(result,options.out/options.repo.name)
             diff=result.get('diff')
-            body='## GhostMaintainer PR Guard\n\nResult: **'+result['status']+'**.\n\n'+('```diff\n'+diff+'\n```' if diff else 'No verified documentation patch proposed.')+'\n\nSee the onboarding-evidence workflow artifact for the full report. Fork PRs receive artifacts only; no write token.'
+            run_url=os.environ.get('GITHUB_SERVER_URL','https://github.com')+'/'+os.environ.get('GITHUB_REPOSITORY','')+'/actions/runs/'+os.environ.get('GITHUB_RUN_ID','')
+            artifact_note=f'[Open workflow and onboarding-evidence artifact]({run_url}).' if os.environ.get('GITHUB_RUN_ID') else 'See the onboarding-evidence workflow artifact for the full report.'
+            body='## GhostMaintainer PR Guard\n\nResult: **'+result['status']+'**.\n\n'+('````diff\n'+diff+'\n````' if diff else 'No verified documentation patch proposed.')+'\n\n'+artifact_note+' Fork PRs receive artifacts only; no write token.'
             options.out.mkdir(parents=True,exist_ok=True)
             (options.out/'comment.md').write_text(body,encoding='utf-8')
             return 0 if result['status'] in ('healthy','repaired') else 2
