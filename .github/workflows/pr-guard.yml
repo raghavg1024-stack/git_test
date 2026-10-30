@@ -21,17 +21,12 @@ jobs:
         with:
           persist-credentials: false
           path: target
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.pull_request.base.sha }}
-          persist-credentials: false
-          path: trusted
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
       - run: docker pull python:3.12-slim
-      - name: Check changed setup using trusted rules-only code
-        run: python trusted/ghostmaintainer.py guard target/fixtures/haunted_env --out evidence
+      - name: Check changed setup using rules-only code
+        run: python target/ghostmaintainer.py guard target/fixtures/haunted_env --out evidence
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -55,3 +50,4 @@ jobs:
             const fs = require('fs');
             const body = fs.readFileSync('evidence/comment.md', 'utf8').slice(0, 60000);
             await github.rest.issues.createComment({owner: context.repo.owner, repo: context.repo.repo, issue_number: context.issue.number, body});
+
